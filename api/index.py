@@ -34,6 +34,8 @@ HOST_REFERER = {
     "thunderstrike77.online": "https://megacloud.blog/",
     "megacloud.blog": "https://megacloud.blog/",
     "megacloud.tv": "https://megacloud.tv/",
+    "rrr.dev23app.site": "https://megaup.nl/",   # add this
+    "dev23app.site": "https://megaup.nl/",        # add this
 }
 
 HOST_NO_VERIFY = {"thunderstrike77.online"}
