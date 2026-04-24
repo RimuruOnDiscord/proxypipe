@@ -34,8 +34,8 @@ HOST_REFERER = {
     "thunderstrike77.online": "https://megacloud.blog/",
     "megacloud.blog": "https://megacloud.blog/",
     "megacloud.tv": "https://megacloud.tv/",
-    "rrr.dev23app.site": "https://megaup.nl/",   # add this
-    "dev23app.site": "https://megaup.nl/",        # add this
+    "rrr.dev23app.site": "https://megaup.nl/",
+    "dev23app.site": "https://megaup.nl/",
 }
 
 HOST_NO_VERIFY = {"thunderstrike77.online"}
@@ -106,21 +106,27 @@ def build_headers(target_url: str, incoming: Request) -> dict:
 
 
 def _is_m3u8_url(url: str) -> bool:
-    """Check if URL path looks like an M3U8 file."""
     path = urlparse(url).path.lower()
     return path.endswith(".m3u8") or path.endswith(".m3u")
 
 
 def _is_m3u8_content(data: bytes, content_type: str = "") -> bool:
-    """Check if content is an HLS playlist."""
     ct = content_type.lower()
     if "mpegurl" in ct or "m3u" in ct:
         return True
     return data.lstrip().startswith(b"#EXTM3U")
 
 
+def _fix_codecs(line: str) -> str:
+    """
+    Rewrite mp4a.40.1 (AAC Main profile) -> mp4a.40.2 (AAC-LC).
+    Browsers reject mp4a.40.1 in MSE (bufferAddCodecError), but the
+    audio data is identical — only the profile flag differs.
+    """
+    return line.replace("mp4a.40.1", "mp4a.40.2")
+
+
 def _rewrite_uri_attr(line: str, playlist_url: str, proxy_base: str) -> str:
-    """Rewrite URI="..." inside HLS tags (EXT-X-KEY, EXT-X-MAP, etc.)."""
     def _replace(m):
         uri = m.group(1)
         if uri.lower().endswith((".vtt", ".srt")):
@@ -143,6 +149,8 @@ def rewrite_hls(playlist_url: str, content: str, proxy_base: str) -> str:
         if stripped.startswith("#") or not stripped:
             if 'URI="' in line:
                 line = _rewrite_uri_attr(line, playlist_url, proxy_base)
+            # Fix codec declarations on EXT-X-STREAM-INF and similar tags
+            line = _fix_codecs(line)
             out.append(line)
             continue
 
@@ -188,7 +196,6 @@ async def debug_decode(encoded: str):
 
 @app.get("/debug/rewrite")
 async def debug_rewrite(url: str, request: Request):
-    """Show what the rewritten M3U8 looks like."""
     root = str(request.base_url).rstrip("/")
     parsed_root = urlparse(root)
     root_host = parsed_root.hostname or ""
@@ -273,15 +280,6 @@ const logEl = document.getElementById('log');
 const PROXY = '__PROXY_HOST__';
 let hls = null;
 
-// Fix: owocdn streams report mp4a.40.1 (AAC Main) which browsers don't support in MSE.
-// Remap to mp4a.40.2 (AAC-LC) which is the same audio data, just a different profile flag.
-const _origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
-MediaSource.prototype.addSourceBuffer = function(mimeType) {
-    const fixed = mimeType.replace('mp4a.40.1', 'mp4a.40.2');
-    if (fixed !== mimeType) console.log('[codec-fix] Remapped:', mimeType, '->', fixed);
-    return _origAddSourceBuffer.call(this, fixed);
-};
-
 function log(msg, type = '') {
     const d = document.createElement('div');
     d.className = 'log-line ' + type;
@@ -307,7 +305,6 @@ async function diagnose() {
 
     log('--- DIAGNOSTICS ---', 'info');
 
-    // 1. Fetch M3U8 through proxy
     const m3u8ProxyUrl = proxyUrl(rawUrl);
     log(`Fetching M3U8: ${m3u8ProxyUrl}`, 'info');
     try {
@@ -318,7 +315,6 @@ async function diagnose() {
         lines.slice(0, 10).forEach(l => log('  ' + l, 'info'));
         log(`  ... (${lines.length} lines total)`, 'info');
 
-        // 2. Find and test the key URL
         const keyLine = lines.find(l => l.includes('EXT-X-KEY'));
         if (keyLine) {
             const keyMatch = keyLine.match(/URI="([^"]+)"/);
@@ -330,7 +326,7 @@ async function diagnose() {
                     const keyBuf = await kr.arrayBuffer();
                     const keyBytes = new Uint8Array(keyBuf);
                     const keyHex = Array.from(keyBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-                    log(`Key status: ${kr.status}, length: ${keyBytes.length} bytes, content-type: ${kr.headers.get('content-type')}`, kr.status === 200 && keyBytes.length === 16 ? 'ok' : 'err');
+                    log(`Key status: ${kr.status}, length: ${keyBytes.length} bytes`, kr.status === 200 && keyBytes.length === 16 ? 'ok' : 'err');
                     log(`Key hex: ${keyHex}`, keyBytes.length === 16 ? 'ok' : 'err');
                     if (keyBytes.length !== 16) log('ERROR: Key should be exactly 16 bytes!', 'err');
                 } catch(e) { log(`Key fetch FAILED: ${e}`, 'err'); }
@@ -339,7 +335,6 @@ async function diagnose() {
             log('No EXT-X-KEY found (unencrypted stream)', 'warn');
         }
 
-        // 3. Find and test first segment
         const segLine = lines.find(l => l.trim() && !l.startsWith('#'));
         if (segLine) {
             log(`First segment URL: ${segLine.substring(0, 100)}...`, 'info');
@@ -350,7 +345,6 @@ async function diagnose() {
                 const segHex = Array.from(segBytes).map(b => b.toString(16).padStart(2, '0')).join('');
                 log(`Segment status: ${sr.status}, content-type: ${sr.headers.get('content-type')}, bytes: ${segBytes.length}`, sr.status >= 200 && sr.status <= 206 ? 'ok' : 'err');
                 log(`Segment first bytes: ${segHex}`, 'info');
-                // Check if it starts with MPEG-TS sync byte (0x47) after decryption
                 if (segBytes[0] === 0x47) log('Segment starts with MPEG-TS sync byte ✓', 'ok');
                 else log('Segment does NOT start with 0x47 (encrypted or non-TS)', 'warn');
             } catch(e) { log(`Segment fetch FAILED: ${e}`, 'err'); }
@@ -363,7 +357,6 @@ function play() {
     let rawUrl = document.getElementById('m3u8Url').value.trim();
     if (!rawUrl) { log('Enter URL first', 'err'); return; }
 
-    // Detect already-proxied URLs
     const pm = rawUrl.match(/\/proxy\/(.+)$/);
     if (pm) {
         try { rawUrl = atob(pm[1].replace(/-/g,'+').replace(/_/g,'/')+'=='); log(`Extracted raw: ${rawUrl}`, 'info'); } catch(e) {}
@@ -381,7 +374,6 @@ function play() {
         debug: false,
         enableWorker: true,
         lowLatencyMode: false,
-        // Try both transmuxing modes
         xhrSetup: (xhr, url) => {
             log(`XHR: ${url.substring(0, 120)}...`);
         }
@@ -425,7 +417,7 @@ function play() {
         if (d.fatal) {
             log('Fatal error! Try "Diagnose" button for details.', 'err');
             if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                log('Attempting codec swap + media error recovery...', 'warn');
+                log('Attempting swap + recover...', 'warn');
                 hls.swapAudioCodec();
                 hls.recoverMediaError();
             }
@@ -455,13 +447,10 @@ async def proxy(encoded: str, request: Request):
     host = urlparse(decoded_url).netloc.split(":")[0].lower()
     skip_verify = _should_skip_verify(host)
     headers = build_headers(decoded_url, request)
-
-    # Request raw bytes — don't let upstream gzip binary segments
     headers["Accept-Encoding"] = "identity"
 
     logger.info("Proxy -> %s (referer=%s, verify=%s)", decoded_url, headers.get("Referer"), not skip_verify)
 
-    # Proxy base URL — only force HTTPS on public hosts (not localhost)
     root = str(request.base_url).rstrip("/")
     parsed_root = urlparse(root)
     root_host = parsed_root.hostname or ""
@@ -474,7 +463,6 @@ async def proxy(encoded: str, request: Request):
 
     try:
         async with httpx.AsyncClient(verify=verify, follow_redirects=True, timeout=60) as client:
-            # Check if this is an M3U8 by URL first
             if _is_m3u8_url(decoded_url):
                 resp = await client.get(decoded_url, headers=headers)
                 if resp.status_code not in (200, 206):
@@ -488,14 +476,12 @@ async def proxy(encoded: str, request: Request):
                     headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"},
                 )
 
-            # For everything else (segments, keys, etc.) — stream raw bytes
             async with client.stream("GET", decoded_url, headers=headers) as resp:
                 if resp.status_code not in (200, 206):
                     body = await resp.aread()
                     return Response(content=body, status_code=resp.status_code,
                                     media_type=resp.headers.get("content-type", "application/octet-stream"))
 
-                # Check if content is actually M3U8 (fallback detection)
                 content_type = resp.headers.get("content-type", "")
                 if "mpegurl" in content_type.lower() or "m3u" in content_type.lower():
                     body = (await resp.aread()).decode("utf-8", errors="replace")
@@ -507,10 +493,8 @@ async def proxy(encoded: str, request: Request):
                         headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"},
                     )
 
-                # Stream binary content (segments, keys, etc.)
                 raw_bytes = await resp.aread()
 
-                # Sniff: maybe it's a playlist after all
                 if raw_bytes.lstrip().startswith(b"#EXTM3U"):
                     logger.info("Detected M3U8 playlist (by content sniff), rewriting")
                     rewritten = rewrite_hls(decoded_url, raw_bytes.decode("utf-8", errors="replace"), proxy_base)
@@ -520,13 +504,9 @@ async def proxy(encoded: str, request: Request):
                         headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"},
                     )
 
-                # Forward as raw binary
-                # IMPORTANT: Do NOT forward upstream content-type — segments may be
-                # disguised as .jpg/.png/etc. Always use application/octet-stream
-                # so hls.js can properly transmux and detect codecs.
                 forward_headers = {
                     "Access-Control-Allow-Origin": "*",
-                    "Content-Type": "application/octet-stream",
+                    "Content-Type": "video/mp2t",
                 }
                 for k in ("content-range", "accept-ranges", "cache-control", "last-modified"):
                     v = resp.headers.get(k)
