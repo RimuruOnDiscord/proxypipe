@@ -17,7 +17,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("proxy")
@@ -524,3 +524,64 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 5001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# ---------- FFMPEG REMUX ENDPOINT ----------
+@app.get("/remux")
+async def remux_video(
+    videoUrl: str,
+    audioUrl: str,
+    request: Request
+):
+    """
+    Remux video with external audio track.
+    Uses FFmpeg to combine video stream with separate audio stream.
+    
+    Usage: /remux?videoUrl=<b64>&audioUrl=<b64>
+    """
+    import subprocess
+    import shlex
+    
+    try:
+        video_decoded = b64_decode(videoUrl)
+        audio_decoded = b64_decode(audioUrl)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to decode URLs: {e}"}, status_code=400)
+    
+    # Build FFmpeg command to remux
+    # We use -re for real-time input and copy for no transcode (just remux)
+    cmd = [
+        "ffmpeg",
+        "-i", video_decoded,
+        "-i", audio_decoded,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-f", "mpegts",
+        "-"
+    ]
+    
+    logger.info(f"Remuxing: video={video_decoded[:80]}... audio={audio_decoded[:80]}...")
+    
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
+        
+        return StreamingResponse(
+            process.stdout,
+            media_type="video/mp2t",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache",
+            }
+        )
+    except FileNotFoundError:
+        return JSONResponse({"error": "FFmpeg not installed on server"}, status_code=501)
+    except Exception as e:
+        logger.exception("Remux failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
