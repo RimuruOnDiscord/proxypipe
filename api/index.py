@@ -17,7 +17,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("proxy")
@@ -524,104 +524,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 5001))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-
-# ---------- FFMPEG REMUX HLS ENDPOINT ----------
-@app.get("/remux")
-async def remux_video(
-    videoUrl: str,
-    audioUrl: str,
-    request: Request
-):
-    """
-    Remux video with external audio track and return HLS manifest.
-    Uses FFmpeg to combine video stream with separate audio stream.
-    
-    Usage: /remux?videoUrl=<b64>&audioUrl=<b64>
-    Returns HLS manifest that the player can use directly.
-    """
-    import subprocess
-    import asyncio
-    
-    try:
-        video_decoded = b64_decode(videoUrl)
-        audio_decoded = b64_decode(audioUrl)
-    except Exception as e:
-        return JSONResponse({"error": f"Failed to decode URLs: {e}"}, status_code=400)
-    
-    root = str(request.base_url).rstrip("/")
-    segment_dir = os.path.join(os.getcwd(), "segments")
-    os.makedirs(segment_dir, exist_ok=True)
-    
-    # Clean old segments
-    for f in os.listdir(segment_dir):
-        os.remove(os.path.join(segment_dir, f))
-    
-    # Build FFmpeg command - output HLS with segments to directory
-    cmd = [
-        "ffmpeg",
-        "-i", video_decoded,
-        "-i", audio_decoded,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-f", "hls",
-        "-hls_time", "4",
-        "-hls_list_size", "0",
-        "-hls_segment_filename", os.path.join(segment_dir, "segment%03d.ts"),
-        "-hls_flags", "delete_segments",
-        os.path.join(segment_dir, "playlist.m3u8")
-    ]
-    
-    logger.info(f"Remuxing: video={video_decoded[:80]}... audio={audio_decoded[:80]}...")
-    
-    try:
-        # Run FFmpeg
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-        )
-        
-        # Wait a bit for segments to generate
-        await asyncio.sleep(3)
-        
-        # Check if playlist exists
-        playlist_path = os.path.join(segment_dir, "playlist.m3u8")
-        if not os.path.exists(playlist_path):
-            return JSONResponse({"error": "FFmpeg failed to generate playlist"}, status_code=500)
-        
-        # Read and return the playlist with rewritten URLs
-        with open(playlist_path, 'r') as f:
-            content = f.read()
-        
-        # Rewrite segment URLs through proxy
-        lines = content.split('\n')
-        out_lines = []
-        for line in lines:
-            if line.strip().endswith('.ts'):
-                out_lines.append(f"{root}/segments/{line.strip()}")
-            else:
-                out_lines.append(line)
-        
-        # Clean up
-        try:
-            process.terminate()
-            process.wait(timeout=2)
-        except:
-            pass
-        
-        return PlainTextResponse(
-            '\n'.join(out_lines),
-            media_type="application/vnd.apple.mpegurl",
-            headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"}
-        )
-        
-    except FileNotFoundError:
-        return JSONResponse({"error": "FFmpeg not installed on server"}, status_code=501)
-    except Exception as e:
-        logger.exception("Remux failed")
-        return JSONResponse({"error": str(e)}, status_code=500)
